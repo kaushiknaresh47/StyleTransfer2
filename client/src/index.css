@@ -89,21 +89,52 @@ body {
   display: grid; gap: 1rem;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
 }
+/* The tile is the <li>; it holds two sibling buttons (select + preview). */
 .tile {
-  width: 100%; padding: 0; cursor: pointer; text-align: left;
+  position: relative;
   background: var(--surface);
   border: 2px solid var(--border); border-radius: var(--radius);
-  overflow: hidden; font: inherit; color: inherit;
+  overflow: hidden;
   transition: border-color 0.15s, transform 0.15s;
 }
 .tile:hover { transform: translateY(-2px); border-color: var(--muted); }
 .tile--selected { border-color: var(--accent); }
-.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tile:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.tile__select {
+  display: block; width: 100%; padding: 0;
+  background: none; border: none; cursor: pointer;
+  text-align: left; font: inherit; color: inherit;
+}
+.tile__select:focus-visible { outline: none; }
+
 .tile__art { display: block; aspect-ratio: 1; width: 100%; background: var(--border); }
 .tile__img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.tile__label { display: block; padding: 0.6rem 0.7rem 0.7rem; }
+.tile__label {
+  display: block;
+  padding: 0.6rem 2.4rem 0.7rem 0.7rem; /* room for the preview button */
+}
 .tile__name { display: block; font-size: 0.88rem; font-weight: 600; }
 .tile__artist { display: block; font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; }
+
+/* Sits beside the name, bottom-right of the label. */
+.tile__preview {
+  position: absolute; right: 0.45rem; bottom: 0.6rem;
+  display: grid; place-items: center;
+  width: 1.75rem; height: 1.75rem; padding: 0;
+  background: var(--surface); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.tile__preview svg {
+  width: 15px; height: 15px; fill: none;
+  stroke: currentColor; stroke-width: 1.8; stroke-linecap: round;
+}
+.tile__preview:hover {
+  color: var(--accent); border-color: var(--accent); background: var(--accent-soft);
+}
+.tile__preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- actions ---------- */
 .actions { text-align: center; padding-top: 0.5rem; }
@@ -147,4 +178,58 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .tile--skeleton { animation: none; }
   .tile { transition: none; }
+}
+
+/* ---------- preview modal ---------- */
+.modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center;
+  padding: 1.5rem;
+  background: rgba(0, 0, 0, 0.72);
+  animation: fade 0.15s ease-out;
+}
+.modal__panel {
+  position: relative;
+  display: flex; flex-direction: column;
+  /* 600px matches the stored image width, so the preview never upscales. */
+  max-width: min(90vw, 600px); max-height: 90vh;
+  background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+  animation: rise 0.18s ease-out;
+}
+.modal__img {
+  display: block; width: 100%; min-height: 0;
+  object-fit: contain; background: var(--bg);
+}
+.modal__bar {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 0.85rem 1rem;
+  border-top: 1px solid var(--border);
+}
+.modal__meta { margin-right: auto; }
+.modal__title { margin: 0; font-size: 1rem; }
+.modal__artist { margin: 0.15rem 0 0; font-size: 0.82rem; color: var(--muted); }
+.modal__nav { display: flex; align-items: center; gap: 0.4rem; }
+.modal__close {
+  position: absolute; top: 0.5rem; right: 0.5rem;
+  display: grid; place-items: center;
+  width: 2rem; height: 2rem; padding: 0;
+  font-size: 1.4rem; line-height: 1;
+  color: #fff; background: rgba(0, 0, 0, 0.55);
+  border: none; border-radius: 50%; cursor: pointer;
+}
+.modal__close:hover { background: rgba(0, 0, 0, 0.8); }
+.modal__close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+.btn--compact { padding: 0.45rem 0.9rem; font-size: 0.85rem; }
+
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal, .modal__panel { animation: none; }
 }
