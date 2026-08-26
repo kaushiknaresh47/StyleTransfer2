@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import ImageUploader from './components/ImageUploader.jsx';
 import StylePicker from './components/StylePicker.jsx';
-import { STYLE_PRESETS } from './stylePresets.js';
+import useStyles from './useStyles.js';
 
 export default function App() {
   const [image, setImage] = useState(null);
   const [styleId, setStyleId] = useState(null);
+  const { styles, status, error } = useStyles();
 
   // Release the object URL so repeated uploads don't leak blobs.
   useEffect(() => () => { if (image) URL.revokeObjectURL(image.url); }, [image]);
@@ -15,8 +16,8 @@ export default function App() {
     setImage(null);
   };
 
-  const ready = Boolean(image && styleId);
-  const chosen = STYLE_PRESETS.find((p) => p.id === styleId);
+  const chosen = styles.find((p) => p.id === styleId);
+  const ready = Boolean(image && chosen);
 
   return (
     <div className="page">
@@ -39,7 +40,13 @@ export default function App() {
           <h2 className="step__heading" id="step-2">
             <span className="step__num">2</span> Choose a style
           </h2>
-          <StylePicker selectedId={styleId} onSelect={setStyleId} />
+          <StylePicker
+            styles={styles}
+            status={status}
+            error={error}
+            selectedId={styleId}
+            onSelect={setStyleId}
+          />
         </section>
 
         <section className="actions">

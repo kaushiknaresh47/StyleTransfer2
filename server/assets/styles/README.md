@@ -1,12 +1,14 @@
 # Style reference images
 
-The style-source images. Vite serves `client/public/` at the web root, so
-`client/public/styles/starry-night.jpg` is fetched by the app as
-`/styles/starry-night.jpg`.
+The style-source images. These are **not** bundled into the frontend — Express
+streams them from this folder via `GET /api/styles/:id/image`
+(see `server/src/routes/styles.js`).
 
-The app reads its list from `client/src/stylePresets.js`; each preset's `file`
-field must match a filename here. A tile whose file is missing falls back to a
-gradient placeholder, so the page still renders if you remove one.
+The catalogue lives in `server/src/data/stylePresets.js`; each preset's `file`
+field must match a filename here. Requests carry only a style `id`, and the
+server resolves the filename from that manifest, so nothing outside this folder
+is reachable. A tile whose file is missing falls back to a gradient placeholder
+in the UI, so the page still renders if you remove one.
 
 All ten are 600x600 center-cropped JPEGs (~150-220 KB each, 1.7 MB total),
 downscaled from Wikimedia Commons originals.
@@ -43,7 +45,9 @@ they were replaced rather than downloaded:
 
 ## Adding or changing a style
 
-Drop a file here and add a matching entry to `stylePresets.js`. Prefer roughly
+Drop a file here and add a matching entry to
+`server/src/data/stylePresets.js`. No frontend change is needed — the client
+renders whatever the API returns. Prefer roughly
 square images, 600-1000px. When sourcing, note that the *photograph* of a
 painting can carry rights of its own even when the painting is public domain —
 stick to Wikimedia Commons or a museum open-access collection (the Met and the

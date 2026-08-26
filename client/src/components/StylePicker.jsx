@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import { STYLE_PRESETS } from '../stylePresets.js';
 
 function StyleTile({ preset, selected, onSelect }) {
-  // Falls back to the gradient swatch until a real file lands in public/styles/.
+  // preset.imageUrl comes from the API (/api/styles/<id>/image); the gradient
+  // swatch stands in if that request fails.
   const [missing, setMissing] = useState(false);
 
   return (
@@ -17,7 +17,7 @@ function StyleTile({ preset, selected, onSelect }) {
           {!missing && (
             <img
               className="tile__img"
-              src={`/styles/${preset.file}`}
+              src={preset.imageUrl}
               alt=""
               loading="lazy"
               onError={() => setMissing(true)}
@@ -33,10 +33,28 @@ function StyleTile({ preset, selected, onSelect }) {
   );
 }
 
-export default function StylePicker({ selectedId, onSelect }) {
+export default function StylePicker({ styles, status, error, selectedId, onSelect }) {
+  if (status === 'loading') {
+    return (
+      <ul className="grid" aria-busy="true">
+        {Array.from({ length: 10 }, (_, i) => (
+          <li key={i}><div className="tile tile--skeleton" /></li>
+        ))}
+      </ul>
+    );
+  }
+
+  if (status === 'error') {
+    return (
+      <p className="error" role="alert">
+        {error} &mdash; is the API running on port 4000?
+      </p>
+    );
+  }
+
   return (
     <ul className="grid">
-      {STYLE_PRESETS.map((preset) => (
+      {styles.map((preset) => (
         <StyleTile
           key={preset.id}
           preset={preset}

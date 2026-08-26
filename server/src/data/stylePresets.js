@@ -1,8 +1,9 @@
-// The 10 style presets shown on the landing page.
+// The style presets the API serves. This module is the single source of truth:
+// the client has no hard-coded list and learns everything from GET /api/styles.
 //
-// `file` is resolved against client/public/styles/ and served at /styles/<file>.
-// Drop a matching image into that folder and the tile picks it up automatically;
-// until then the tile renders its `swatch` gradient as a placeholder.
+// `file` names an image in server/assets/styles/. It is never taken from a
+// request -- a client sends only an `id`, which is looked up here -- so a
+// request can't reach outside that folder.
 export const STYLE_PRESETS = [
   {
     id: 'starry-night',
