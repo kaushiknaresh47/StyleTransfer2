@@ -1,7 +1,8 @@
 name: Claude Code
 
 # Responds when someone writes "@claude" in an issue, a pull request comment,
-# or a pull request review. Requires an ANTHROPIC_API_KEY repository secret.
+# or a pull request review. Authenticates with a Claude subscription via the
+# CLAUDE_CODE_OAUTH_TOKEN repository secret.
 on:
   issue_comment:
     types: [created]
@@ -37,6 +38,6 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: |
             --allowedTools "Bash(npm ci),Bash(npm install),Bash(npm run build),Bash(npm run dev),Bash(npm start)"
