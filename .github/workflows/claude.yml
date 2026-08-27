@@ -1,8 +1,9 @@
 name: Claude Code
 
-# Responds when someone writes "@claude" in an issue, a pull request comment,
-# or a pull request review. Authenticates with a Claude subscription via the
-# CLAUDE_CODE_OAUTH_TOKEN repository secret.
+# Responds when kaushiknaresh47 writes "@claude" in an issue, a pull request
+# comment, or a pull request review. Mentions by anyone else are ignored.
+# Authenticates with a Claude subscription via the CLAUDE_CODE_OAUTH_TOKEN
+# repository secret.
 on:
   issue_comment:
     types: [created]
@@ -15,12 +16,16 @@ on:
 
 jobs:
   claude:
-    # Skip the run entirely unless the trigger phrase is present.
+    # Skip the run entirely unless the trigger phrase is present AND the person
+    # who wrote it is the repository owner. Nobody else can start a run, so
+    # comments from other users — and from claude[bot] itself — are ignored.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.actor == 'kaushiknaresh47' && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
