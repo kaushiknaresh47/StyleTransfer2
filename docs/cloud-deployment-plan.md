@@ -5,9 +5,9 @@
 Per [`docs/python-style-transfer-integration-plan.md`](./python-style-transfer-integration-plan.md), the app has (or will have) three pieces plus a database:
 
 1. **`client/`** — static build output (Vite). No server-side rendering, just files behind a CDN/host.
-2. **`server/`** — Express API (Node 18+), stateless, talks to Postgres and proxies job submissions to `stylizer/`.
+2. **`server/`** — Express API (Node 18+), talks to Postgres (eventually) and proxies job submissions to `stylizer/`. Treat it as a **job broker**, not a long-running compute process.
 3. **`stylizer/`** — Python FastAPI service wrapping `stylize/styletransfer.py`. **This is the component free tiers fight hardest against**, and now that the script has been read, harder than this doc previously assumed.
-4. **Postgres** — currently just a health check; the integration plan gives it a real job (the `stylize_jobs` table).
+4. **Postgres** — currently just a health check; the integration plan gives it a real job (the `stylize_jobs` table) in a later phase, not the first local vertical slice.
 
 ## What reading the script changed
 
@@ -21,7 +21,7 @@ The earlier version of this doc assumed a feed-forward model: load weights once,
 
 Point 1 also softens the argument that cold starts are the main enemy. A 10–30s model load is a real cost, but against a 2–5 minute job it's overhead, not the dominant term. **Since the integration plan makes the API asynchronous (submit → poll → fetch), a cold start is absorbed into a wait the user is already being shown progress for.** That makes scale-to-zero serverless far more acceptable than this doc originally concluded — the trade-off it framed as "always warm vs. free forever" is much less painful once the client is built to wait.
 
-The real constraint is no longer warmth. It is **RAM ceilings and per-request execution time limits.**
+The real constraint is no longer warmth. It is **RAM ceilings and per-request execution time limits** — plus a platform-specific gotcha for "return 202, keep working in the background" that the free-tier picks have to respect (see below).
 
 ## Free-tier building blocks by service
 
@@ -34,14 +34,16 @@ The real constraint is no longer warmth. It is **RAM ceilings and per-request ex
 
 Unchanged by the script — the client is static files either way.
 
+**Same-origin note.** The client talks to **relative** `/api/...` paths today (Vite proxies in dev). Splitting `client/` onto Firebase/S3 and `server/` onto Cloud Run creates a cross-origin split unless you add Firebase/CloudFront **rewrites** to the API, or teach the client an API base URL + CORS. Option A below assumes rewrites (or a single front door), not raw cross-origin `fetch`.
+
 ### API (`server/`, Node/Express)
 | Cloud | Free option | Notes |
 |---|---|---|
-| AWS | Lambda (1M requests + 400,000 GB-s/month, always free) via Function URLs; or EC2 `t2/t3.micro` (750 hrs/mo, 12 months only) | Express needs `serverless-http`. Cold starts are milliseconds for a thin API. |
+| AWS | Lambda (1M requests + 400,000 GB-s/month, always free) via Function URLs; or EC2 `t2/t3.micro` (750 hrs/mo, 12 months only) | Express needs `serverless-http`. Fine for a thin broker; **do not** run the transfer inside the Lambda. |
 | GCP | Cloud Run (2M requests, 360,000 GB-s, 180,000 vCPU-s/month, always free) | Standard container, no code changes. Scale-to-zero is fine here. |
 | Azure | Container Apps (180,000 vCPU-s + 360,000 GiB-s + 2M requests/month, always free) or App Service Free (F1) | Comparable to Cloud Run. |
 
-Also largely unchanged — but note the server is now a **job broker**, so it must not hold a request open for the duration of a transfer. Its own timeout limits stop being a concern precisely because the integration plan made the API async.
+The server is a **job broker**, so it must not hold a request open for the duration of a transfer. Its own timeout limits stop being a concern precisely because the integration plan made the API async. Prefer keeping result bytes on the stylizer (or object storage) rather than a local `output_path` on Express — a filesystem path makes multi-instance Express lying about being "stateless."
 
 ### Postgres
 | Cloud | Free option | Notes |
@@ -50,7 +52,7 @@ Also largely unchanged — but note the server is now a **job broker**, so it mu
 | GCP | No free Cloud SQL tier | Previously suggested self-hosting on `e2-micro`; that box is too small for the stylizer and isn't in either option now, so this means a third-party free tier. |
 | Azure | PostgreSQL Flexible Server `B1ms`, 750 hrs/mo + 32 GB — **12 months only** | Same expiry caveat. |
 
-None of the three offers a free-forever managed Postgres. **Supabase or Neon** (no credit card, no expiry) reached over the internet is the pragmatic choice, and more clearly so now that the `e2-micro` self-hosting option is off the table.
+None of the three offers a free-forever managed Postgres. **Supabase or Neon** (no credit card, no expiry) reached over the internet is the pragmatic choice, and more clearly so now that the `e2-micro` self-hosting option is off the table. Not required for the first local integration (see the integration plan's phase split).
 
 ### The style-transfer service (`stylizer/`)
 
@@ -58,26 +60,36 @@ This is where the analysis genuinely changes. Requirements are now: **≥2 GB RA
 
 | Cloud | Free option | Fit, given the script |
 |---|---|---|
-| AWS | Lambda container image (up to 10 GB image, 10 GB RAM) — always-free quota | RAM is fine, but the **15-minute hard execution cap** is the risk: a 300-step job at higher resolution can approach it, and there's no partial result. Weights must be baked into the image. Cost accrues against the 400,000 GB-s grant fast: at 2 GB, that's ~200,000 seconds ≈ 55 hours of compute/month, so roughly 600–1,600 jobs — plenty for personal use. |
+| AWS | Lambda container image (up to 10 GB image, 10 GB RAM) — always-free quota | RAM is fine, but the model fights the async design: **Lambda dies when the invocation returns**, so a 202-then-background-worker pattern does not work. You'd need the transfer to run *inside* one long invoke (hitting the **15-minute hard cap**) or an extra queue + worker (Step Functions / SQS). Weights must be baked into the image. Cost accrues against the 400,000 GB-s grant fast: at 2 GB, that's ~200,000 seconds ≈ 55 hours of compute/month, so roughly 600–1,600 jobs — plenty for personal use if the orchestration exists. |
 | AWS | EC2 `t3.small` (2 GB) | Not free — `t2/t3.micro` (1 GB) is the free-tier size and is too small, same as `e2-micro`. |
-| GCP | Cloud Run, configured with **2–4 GB RAM** | Good fit. Up to 8 GB RAM and a 60-minute request timeout, comfortably past the script's needs. Scale-to-zero costs a cold start (container + weights), acceptable under an async API. The always-free grant is **360,000 GB-s**, so at 2 GB that's ~180,000 seconds ≈ 50 hours/month. `min-instances=1` is still available but no longer worth paying for. |
+| GCP | Cloud Run, configured with **2–4 GB RAM** | Good fit on RAM/timeout paper (up to 8 GB, 60-minute request timeout). See **[Cloud Run + background jobs](#cloud-run--background-jobs-required-reading-for-option-a)** before treating this as drop-in. Free grant **360,000 GB-s** ≈ 50 hours/month at 2 GB. |
 | GCP | `e2-micro` always-free VM | **No longer recommended.** 1 GB RAM will not hold PyTorch + VGG-19 + a per-request deepcopy. This was the previous primary recommendation and is withdrawn. |
-| Azure | Container Apps, scaled to 2 GB | Equivalent to Cloud Run; free grant 360,000 GiB-s. Consumption plan supports long-running requests. |
+| Azure | Container Apps, scaled to 2 GB | Equivalent class of problem to Cloud Run (CPU allocation / background work after the HTTP response). Free grant 360,000 GiB-s. |
 | Any | GPU | No free GPU tier exists on any of the three for sustained use, but a **Spot** GPU is cheap enough to be worth costing out properly — see [Costed alternative](#costed-alternative-a-t4-spot-vm) below. |
+
+### Cloud Run + background jobs (required reading for Option A)
+
+The integration plan's stylizer returns **202 immediately** and runs LBFGS on an in-process worker. That is correct for a long-lived local process. On Cloud Run it is easy to get wrong:
+
+1. **CPU is throttled between requests by default.** After `POST /stylize` returns, a background `asyncio` worker may receive little or no CPU. Fix: enable **CPU always allocated** for the stylizer service (billed for the instance's lifetime while it is up), or keep a request open for the duration (which reintroduces proxy timeouts and defeats the point), or move the work to **Cloud Run jobs** / a task queue.
+2. **In-memory job state + scale-to-zero / multi-instance.** `GET /jobs/{id}` must hit the same instance that accepted the job, and that instance must stay alive until the job finishes. `min-instances=0` is fine *between* jobs, but not if the platform replaces the instance mid-run. Mitigations: `--max-instances=1` (serialize at the platform too), sticky routing (fragile), or externalize job state + results (Redis/Postgres + object storage) — which is more machinery than Option A admits at first glance.
+3. **Cold start still includes model load** unless weights are in the image; that is acceptable under async UX, but the first poll after a cold start should expect `queued`/`running` with step 0 for a while.
+
+None of this kills Option A; it means the stylizer Cloud Run service is configured deliberately (always-on CPU while instances exist, max instances 1, weights baked in), not "deploy the local FastAPI app unchanged."
 
 ### Costed alternative: a T4 Spot VM
 
 Everything above chases a free tier, which forces the CPU path and a multi-minute job. Attaching a GPU changes the product rather than just the hosting: a T4 turns a ~300-step VGG-19 optimization from minutes into seconds, which is the difference between "come back later" and "wait a moment."
 
-Priced on the GCP calculator (`us-central1`, Spot, no commitment):
+Priced on the GCP calculator (`us-central1`, Spot, no commitment) — **spot prices move; treat these as an order-of-magnitude snapshot, not a quote**:
 
 | Component | Config | Rate | 24 h/month |
 |---|---|---|---|
-| GPU | 1× NVIDIA T4, Spot | $0.20/hr | $4.80 |
-| Machine | `n1-standard-1` (1 vCPU, 3.75 GB), Spot | ~$0.0246/hr | $0.59 |
-| Boot disk | 10 GiB balanced PD | — | $1.00/mo |
+| GPU | 1× NVIDIA T4, Spot | ~$0.20/hr | ~$4.80 |
+| Machine | `n1-standard-1` (1 vCPU, 3.75 GB), Spot | ~$0.0246/hr | ~$0.59 |
+| Boot disk | 10 GiB balanced PD | — | ~$1.00/mo |
 | OS | Ubuntu LTS | free | $0.00 |
-| | | | **≈ $6.40/mo** |
+| | | | **≈ $6–7/mo** |
 
 **Two constraints on that number, and they matter more than the number itself:**
 
@@ -99,38 +111,39 @@ There are two defensible answers, and they differ on a single axis: **do you pay
 
 ### Option A — free, slow (Cloud Run, CPU)
 
-- `client/` → Firebase Hosting
-- `server/` → Cloud Run, 512 MB, scale-to-zero
-- `stylizer/` → Cloud Run, **2 GB RAM, generous timeout, `min-instances=0`**, weights baked into the container image so cold start is container boot + model load rather than a 548 MB download
-- Postgres → Supabase or Neon free tier
-- Output images → object storage, or straight back through the API at personal scale
+- `client/` → Firebase Hosting **with rewrites** to the API (keep relative `/api` paths), or an explicit API base URL
+- `server/` → Cloud Run, 512 MB, scale-to-zero (broker only)
+- `stylizer/` → Cloud Run, **2 GB RAM**, **CPU always allocated**, **`max-instances=1`**, generous timeout, `min-instances=0` between jobs, weights baked into the container image so cold start is container boot + model load rather than a 548 MB download
+- Postgres → Supabase or Neon free tier (when phase-2 job persistence lands)
+- Output images → stay on the stylizer (or object storage); do not rely on Express-local paths
 
-Stays inside always-free grants (~360,000 GB-s ≈ 50 hours of 2 GB compute/month). No orchestration beyond deploying two containers, no billing risk, and nothing to remember to turn off. Every job takes minutes.
+Stays inside always-free grants (~360,000 GB-s ≈ 50 hours of 2 GB compute/month), with the caveat that **always-allocated CPU** changes how that grant burns while an instance is up idle — shut instances down when the queue is empty (`min-instances=0`) so idle time is actually free.
 
-Cloud Run is the pick over AWS Lambda mainly because Lambda's **15-minute hard execution cap** is a ceiling on job size rather than a soft cost — it constrains the resolution and step count you can offer. Azure Container Apps is close to equivalent to Cloud Run.
+Cloud Run is the pick over AWS Lambda mainly because Lambda cannot host the integration plan's 202-and-background-worker shape without extra queue infrastructure, and its **15-minute hard execution cap** would otherwise ceiling job size. Azure Container Apps is close to Cloud Run if configured with the same background-CPU awareness.
 
 ### Option B — ~$6/month, fast (T4 Spot VM)
 
 - `client/`, `server/`, Postgres → as in Option A
 - `stylizer/` → `n1-standard-1` + 1× T4, **Spot**, Ubuntu LTS, started and stopped around usage (see [Costed alternative](#costed-alternative-a-t4-spot-vm))
 
-Jobs finish in seconds instead of minutes, and the script's 1000px path becomes usable. The price holds **only** with start/stop automation; left running it's ~$165/mo. Requires building that orchestration, and accepting Spot preemption.
+Jobs finish in seconds instead of minutes, and the script's 1000px path becomes usable. The price holds **only** with start/stop automation; left running it's ~$165/mo. Requires building that orchestration, and accepting Spot preemption. A long-lived VM also sidesteps the Cloud Run background-CPU issue — the process just keeps running.
 
 ### Which to build first
 
-**Start with Option A.** It's free, it's less work, and the async submit/poll/progress design the integration plan specifies is required either way — that work is not wasted if you later switch. Once it runs end to end you'll have a real measurement of how bad the CPU wait actually is, which is the only honest input to whether the GPU is worth $6/mo and an orchestration layer.
+**Start with Option A**, after the local three-process integration works. It's free, it's less work than GPU orchestration, and the async submit/poll/progress design the integration plan specifies is required either way — that work is not wasted if you later switch. Once it runs end to end you'll have a real measurement of how bad the CPU wait actually is, which is the only honest input to whether the GPU is worth ~$6/mo and an orchestration layer.
 
 Option B is the right answer if the measured CPU wait turns out to be intolerable, or if 1000px output is a goal. Deciding that *before* measuring is guessing.
 
 ## Non-cloud-giant alternatives
 
-The ask was AWS/GCP/Azure, so this doc stays scoped there, but for a personal project **Render**, **Railway**, and **Fly.io** deploy a containerized Python service with far less ceremony, and **Vercel**/**Netlify** handle the static client. Free tiers there are generally tighter on RAM than Cloud Run's configurable 2–4 GB, which is exactly the axis that matters here — worth checking against the ≥2 GB requirement rather than assuming.
+The ask was AWS/GCP/Azure, so this doc stays scoped there, but for a personal project **Render**, **Railway**, and **Fly.io** deploy a containerized Python service with far less ceremony, and **Vercel**/**Netlify** handle the static client. Free tiers there are generally tighter on RAM than Cloud Run's configurable 2–4 GB, which is exactly the axis that matters here — worth checking against the ≥2 GB requirement rather than assuming. A single small always-on VM on those platforms can also be simpler than Cloud Run's background-CPU rules for a personal queue of one.
 
 ## Open items
 
 - **Measure before committing.** Peak RSS and wall-clock for one job at 256px and at 512px would settle the instance sizing, which drives every recommendation above. The "≥2 GB" figure is reasoned from PyTorch's typical footprint, not measured — torch isn't installed on the dev machine.
-- **Target resolution and step count** (open questions 2 and 3 in the integration plan) set the per-job cost, and therefore how many jobs fit in a monthly free grant.
-- Whether outputs are retained (and for how long) determines whether object storage is needed or results can be transient.
-- Expected traffic: the GB-s grants above allow roughly 50 hours of 2 GB compute per month — fine for personal use, quickly exhausted by a shared demo.
+- **Target resolution and step count** (open questions 2 and 3 in the integration plan; defaults recommended there) set the per-job cost, and therefore how many jobs fit in a monthly free grant.
+- Whether outputs are retained (and for how long) determines whether object storage is needed or results can be transient — and whether Express may stream-through only.
+- Expected traffic: the GB-s grants above allow roughly 50 hours of 2 GB compute per month — fine for personal use, quickly exhausted by a shared demo. **A public URL with no auth is an easy way to burn the grant**; a shared secret or basic rate limit belongs in the first public deploy.
+- **Cloud Run stylizer config** (CPU always allocated, max-instances 1, weights in image) must be part of Option A, not an afterthought — see [above](#cloud-run--background-jobs-required-reading-for-option-a).
 - **If Option B is chosen**, the start/stop orchestration (Cloud Run → Compute API, plus an idle shutdown) is a work item in its own right, and the failure mode is a GPU left running at ~$165/mo. A budget alert is not optional.
 - No CI/CD, custom domain, HTTPS, or secrets management is covered here — follow-up once a target is chosen.
