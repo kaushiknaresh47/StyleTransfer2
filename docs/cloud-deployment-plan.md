@@ -47,7 +47,7 @@ Also largely unchanged — but note the server is now a **job broker**, so it mu
 | Cloud | Free option | Notes |
 |---|---|---|
 | AWS | RDS `db.t3.micro`/`db.t4g.micro`, 750 hrs/mo + 20 GB — **12 months only** | ~$15+/mo afterwards. |
-| GCP | No free Cloud SQL tier | Previously suggested self-hosting on `e2-micro`; that box is now spoken for (and too small), so this means a third-party free tier. |
+| GCP | No free Cloud SQL tier | Previously suggested self-hosting on `e2-micro`; that box is too small for the stylizer and isn't in either option now, so this means a third-party free tier. |
 | Azure | PostgreSQL Flexible Server `B1ms`, 750 hrs/mo + 32 GB — **12 months only** | Same expiry caveat. |
 
 None of the three offers a free-forever managed Postgres. **Supabase or Neon** (no credit card, no expiry) reached over the internet is the pragmatic choice, and more clearly so now that the `e2-micro` self-hosting option is off the table.
@@ -63,23 +63,64 @@ This is where the analysis genuinely changes. Requirements are now: **≥2 GB RA
 | GCP | Cloud Run, configured with **2–4 GB RAM** | Good fit. Up to 8 GB RAM and a 60-minute request timeout, comfortably past the script's needs. Scale-to-zero costs a cold start (container + weights), acceptable under an async API. The always-free grant is **360,000 GB-s**, so at 2 GB that's ~180,000 seconds ≈ 50 hours/month. `min-instances=1` is still available but no longer worth paying for. |
 | GCP | `e2-micro` always-free VM | **No longer recommended.** 1 GB RAM will not hold PyTorch + VGG-19 + a per-request deepcopy. This was the previous primary recommendation and is withdrawn. |
 | Azure | Container Apps, scaled to 2 GB | Equivalent to Cloud Run; free grant 360,000 GiB-s. Consumption plan supports long-running requests. |
-| Any | GPU | No free GPU tier exists on any of the three for sustained use. A GPU would cut runtime ~10–50× and enable the script's 1000px path, but it's a paid decision. |
+| Any | GPU | No free GPU tier exists on any of the three for sustained use, but a **Spot** GPU is cheap enough to be worth costing out properly — see [Costed alternative](#costed-alternative-a-t4-spot-vm) below. |
+
+### Costed alternative: a T4 Spot VM
+
+Everything above chases a free tier, which forces the CPU path and a multi-minute job. Attaching a GPU changes the product rather than just the hosting: a T4 turns a ~300-step VGG-19 optimization from minutes into seconds, which is the difference between "come back later" and "wait a moment."
+
+Priced on the GCP calculator (`us-central1`, Spot, no commitment):
+
+| Component | Config | Rate | 24 h/month |
+|---|---|---|---|
+| GPU | 1× NVIDIA T4, Spot | $0.20/hr | $4.80 |
+| Machine | `n1-standard-1` (1 vCPU, 3.75 GB), Spot | ~$0.0246/hr | $0.59 |
+| Boot disk | 10 GiB balanced PD | — | $1.00/mo |
+| OS | Ubuntu LTS | free | $0.00 |
+| | | | **≈ $6.40/mo** |
+
+**Two constraints on that number, and they matter more than the number itself:**
+
+1. **It assumes ~24 hours of uptime per month.** Run the same VM continuously and it is **~$165/mo** — the GPU alone is ~$146. The boot disk bills continuously either way. This price is a claim about usage discipline, not about hardware.
+2. **It requires start/stop orchestration that doesn't exist yet.** Something always-on must receive the job and boot the VM: Cloud Run (`server/`) calls the Compute API to start the instance, polls for readiness, submits, then stops it after an idle timeout. Cold start becomes VM boot + model load — worse than a Cloud Run cold start, but the async job model already absorbs it. **This is the real cost of this option: not $6, but the orchestration and the risk of leaving the box running.**
+
+Other notes specific to this configuration:
+
+- **`n1-standard-1` is the floor.** T4 attaches to **N1 only**; shared-core types (`f1-micro`, `g1-small`) are explicitly excluded, so the cheapest-looking VM on the calculator is not a legal GPU host. 3.75 GB also clears the ≥2 GB requirement with room to spare.
+- **Ubuntu Pro is a paid license** (~$0.88/mo) with no benefit here — use plain Ubuntu LTS.
+- **Spot means preemption**, 30 seconds' notice. On a GPU a job is short enough that losing one is cheap, but the VM stays down until something restarts it (a MIG with auto-restart, or the same orchestration above). The job queue makes retries cheap.
+- **Avoid a committed use discount.** A 1-year CUD is billed for its full term "regardless of whether or not you use those resources," which destroys the intermittent-usage premise this price depends on. Commitments only pay off for always-on workloads, and they don't stack with Spot.
+- **The script jumps to 1000px on a GPU.** `imsize = 1000 if torch.cuda.is_available() else 256` means attaching a T4 silently multiplies the pixel count ~15×, spending much of the speedup on resolution. Probably desirable, but it should become an explicit parameter (open question 2 in the integration plan) rather than a hardware side effect.
+- **The $300 new-customer credit** covers many months of this without any commitment — the sane way to find out whether the GPU is worth it.
 
 ## Recommendation
 
-**Primary: GCP**, but for a different reason than before — not the free always-on VM (now ruled out), but because **Cloud Run's memory ceiling and 60-minute request timeout are the most forgiving fit for a multi-minute, ~2 GB job inside a free tier.**
+There are two defensible answers, and they differ on a single axis: **do you pay to make the wait short?**
+
+### Option A — free, slow (Cloud Run, CPU)
 
 - `client/` → Firebase Hosting
-- `server/` → Cloud Run, small (512 MB), scale-to-zero
+- `server/` → Cloud Run, 512 MB, scale-to-zero
 - `stylizer/` → Cloud Run, **2 GB RAM, generous timeout, `min-instances=0`**, weights baked into the container image so cold start is container boot + model load rather than a 548 MB download
 - Postgres → Supabase or Neon free tier
-- Output images → a small object-storage bucket, or straight back through the API for a personal-scale project
+- Output images → object storage, or straight back through the API at personal scale
 
-**Second choice: Azure Container Apps**, which is close to equivalent. **AWS Lambda** works too and its RAM ceiling is the highest of the three, but the 15-minute execution cap is a real ceiling on job size rather than a soft cost, so it constrains the resolution/step-count you can offer.
+Stays inside always-free grants (~360,000 GB-s ≈ 50 hours of 2 GB compute/month). No orchestration beyond deploying two containers, no billing risk, and nothing to remember to turn off. Every job takes minutes.
 
-**What to accept:** a cold start on the first request after idle. Because the integration plan already builds submit-and-poll with a live progress indicator, this lands inside a wait the user can see, which is why it's no longer worth contorting the architecture to avoid.
+Cloud Run is the pick over AWS Lambda mainly because Lambda's **15-minute hard execution cap** is a ceiling on job size rather than a soft cost — it constrains the resolution and step count you can offer. Azure Container Apps is close to equivalent to Cloud Run.
 
-**What would change this:** if runtime proves worse than estimated, or if 1000px output is wanted, the answer stops being a free tier and becomes a paid GPU instance. That decision needs a real measurement first (see open items).
+### Option B — ~$6/month, fast (T4 Spot VM)
+
+- `client/`, `server/`, Postgres → as in Option A
+- `stylizer/` → `n1-standard-1` + 1× T4, **Spot**, Ubuntu LTS, started and stopped around usage (see [Costed alternative](#costed-alternative-a-t4-spot-vm))
+
+Jobs finish in seconds instead of minutes, and the script's 1000px path becomes usable. The price holds **only** with start/stop automation; left running it's ~$165/mo. Requires building that orchestration, and accepting Spot preemption.
+
+### Which to build first
+
+**Start with Option A.** It's free, it's less work, and the async submit/poll/progress design the integration plan specifies is required either way — that work is not wasted if you later switch. Once it runs end to end you'll have a real measurement of how bad the CPU wait actually is, which is the only honest input to whether the GPU is worth $6/mo and an orchestration layer.
+
+Option B is the right answer if the measured CPU wait turns out to be intolerable, or if 1000px output is a goal. Deciding that *before* measuring is guessing.
 
 ## Non-cloud-giant alternatives
 
@@ -91,4 +132,5 @@ The ask was AWS/GCP/Azure, so this doc stays scoped there, but for a personal pr
 - **Target resolution and step count** (open questions 2 and 3 in the integration plan) set the per-job cost, and therefore how many jobs fit in a monthly free grant.
 - Whether outputs are retained (and for how long) determines whether object storage is needed or results can be transient.
 - Expected traffic: the GB-s grants above allow roughly 50 hours of 2 GB compute per month — fine for personal use, quickly exhausted by a shared demo.
+- **If Option B is chosen**, the start/stop orchestration (Cloud Run → Compute API, plus an idle shutdown) is a work item in its own right, and the failure mode is a GPU left running at ~$165/mo. A budget alert is not optional.
 - No CI/CD, custom domain, HTTPS, or secrets management is covered here — follow-up once a target is chosen.
