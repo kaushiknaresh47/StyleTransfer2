@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import ImageUploader from './components/ImageUploader.jsx';
 import StylePicker from './components/StylePicker.jsx';
+import Footer from './components/Footer.jsx';
 import useStyles from './useStyles.js';
 
 export default function App() {
@@ -22,7 +23,7 @@ export default function App() {
   return (
     <div className="page">
       <header className="header">
-        <h1 className="header__title">StyleTransfer</h1>
+        <h1 className="header__title">Style Transfer</h1>
         <p className="header__tagline">
           Upload a photo, pick a painting, and borrow its style.
         </p>
@@ -66,6 +67,8 @@ export default function App() {
           )}
         </section>
       </main>
+
+      <Footer />
     </div>
   );
 }
