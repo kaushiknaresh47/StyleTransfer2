@@ -5,70 +5,90 @@
 Per [`docs/python-style-transfer-integration-plan.md`](./python-style-transfer-integration-plan.md), the app has (or will have) three pieces plus a database:
 
 1. **`client/`** — static build output (Vite). No server-side rendering, just files behind a CDN/host.
-2. **`server/`** — Express API (Node 18+), stateless, talks to Postgres and (soon) proxies to `stylizer/`.
-3. **`stylizer/`** — planned Python FastAPI microservice that loads an ML model **once** and stays warm in memory. This is the component that free tiers fight hardest against (see below).
-4. **Postgres** — currently just a health check, but the app's database of record.
+2. **`server/`** — Express API (Node 18+), stateless, talks to Postgres and proxies job submissions to `stylizer/`.
+3. **`stylizer/`** — Python FastAPI service wrapping `stylize/styletransfer.py`. **This is the component free tiers fight hardest against**, and now that the script has been read, harder than this doc previously assumed.
+4. **Postgres** — currently just a health check; the integration plan gives it a real job (the `stylize_jobs` table).
 
-## The core tension
+## What reading the script changed
 
-Every major cloud's genuinely-free compute is either:
-- **scale-to-zero serverless** (AWS Lambda, GCP Cloud Run, Azure Functions/Container Apps) — free quotas are generous and never expire, but the instance is killed when idle, so the model reloads from disk on the next request (cold start). This directly conflicts with the "load once, stay warm" design goal in the integration plan.
-- **a small always-on VM, free forever, but tiny** (GCP `e2-micro`: 1 vCPU burstable, 1 GB RAM) — enough to stay warm, but likely too little RAM for a PyTorch/TensorFlow model plus the OS and Express/Postgres alongside it.
-- **a bigger always-on VM, free for 12 months only** (AWS EC2 `t2/t3.micro`, Azure B1s) — fine for a demo, but becomes a paid resource after a year on a new account.
+The earlier version of this doc assumed a feed-forward model: load weights once, infer in milliseconds, and the only question was cold starts. The script is **Gatys-style optimization**, which is a different resource profile in three ways that matter for hosting:
 
-There is no combination of "always warm" + "handles a real ML model" + "free forever" across any of the three clouds. Any plan has to pick two of those three. This doc lays out the free-tier building blocks per cloud, then a recommended trade-off.
+1. **Each request is minutes of pinned compute**, not milliseconds. ~300 forward+backward passes through VGG-19, optimizing the image itself with LBFGS. Timings are unverified (torch isn't installed locally), but CPU at 256px is single-digit minutes.
+2. **RAM is the binding constraint, and it's larger than assumed.** The PyTorch CPU runtime alone is typically several hundred MB resident before any model loads. Add VGG-19 features (~20M params, ~80 MB fp32), a **`copy.deepcopy` of that stack per request**, plus activations and LBFGS history for the image being optimized. A realistic floor is well over 1 GB, and that is before the OS and anything else on the box.
+3. **Weights are a ~548 MB download** on first use (`models.vgg19(pretrained=True)`), cached under `~/.cache/torch`. On ephemeral/serverless filesystems this re-downloads unless baked into the image.
+
+**The direct casualty is this doc's previous primary recommendation.** GCP's always-free `e2-micro` (1 vCPU, **1 GB RAM**) was recommended as the home for `stylizer/` because it stays warm forever at no cost. Point 2 makes that not viable: PyTorch plus VGG-19 plus a per-request deepcopy will not fit in 1 GB, and even if it were squeezed in, 1 burstable vCPU running a multi-minute optimization would be punishing. Self-hosting Postgres on the same box, as previously suggested, is now clearly out.
+
+Point 1 also softens the argument that cold starts are the main enemy. A 10–30s model load is a real cost, but against a 2–5 minute job it's overhead, not the dominant term. **Since the integration plan makes the API asynchronous (submit → poll → fetch), a cold start is absorbed into a wait the user is already being shown progress for.** That makes scale-to-zero serverless far more acceptable than this doc originally concluded — the trade-off it framed as "always warm vs. free forever" is much less painful once the client is built to wait.
+
+The real constraint is no longer warmth. It is **RAM ceilings and per-request execution time limits.**
 
 ## Free-tier building blocks by service
 
 ### Static frontend (`client/`)
 | Cloud | Free option | Notes |
 |---|---|---|
-| AWS | S3 (5 GB, 12 months) + CloudFront (1 TB/mo transfer, always free) | CloudFront's free tier doesn't expire; S3 storage free tier does after 12 months, but a built React app is a few MB, well under paid-tier pricing anyway. |
-| GCP | Firebase Hosting (10 GB storage, 360 MB/day transfer, always free) | Not "Cloud Run/Compute" but is a first-party GCP product (same Firebase/GCP project, same billing account). Simplest static host of the three. |
-| Azure | Static Web Apps — Free plan (100 GB/mo bandwidth, custom domain + SSL, always free) | Purpose-built for exactly this (SPA + API proxy config), arguably the best-fit free static host here. |
+| AWS | S3 (5 GB, 12 months) + CloudFront (1 TB/mo transfer, always free) | CloudFront's free tier doesn't expire; S3's does after 12 months, but a built React app is a few MB. |
+| GCP | Firebase Hosting (10 GB storage, 360 MB/day transfer, always free) | Simplest static host of the three. |
+| Azure | Static Web Apps — Free plan (100 GB/mo bandwidth, custom domain + SSL, always free) | Purpose-built for SPA + API proxy config. |
+
+Unchanged by the script — the client is static files either way.
 
 ### API (`server/`, Node/Express)
 | Cloud | Free option | Notes |
 |---|---|---|
-| AWS | Lambda (1M requests + 400,000 GB-s compute/month, always free) via API Gateway or Lambda Function URLs; or EC2 `t2/t3.micro` (750 hrs/mo, 12 months only) | Express needs a thin adapter (`serverless-http`) to run on Lambda. Cold starts are milliseconds for a small API — much less of a problem than for the model service. |
-| GCP | Cloud Run (2M requests, 360,000 GB-s memory, 180,000 vCPU-s/month, always free) | Runs a standard Docker container, no code changes to Express needed. Scales to zero between requests, which is fine for a plain API. |
-| Azure | Azure Container Apps (180,000 vCPU-s + 360,000 GiB-s + 2M requests/month, always free) or App Service Free (F1) tier (60 CPU-min/day, sleeps after idle) | Container Apps free grant is comparable to Cloud Run; App Service F1 is more limited (shared CPU, daily quota) but zero-config for a Node app. |
+| AWS | Lambda (1M requests + 400,000 GB-s/month, always free) via Function URLs; or EC2 `t2/t3.micro` (750 hrs/mo, 12 months only) | Express needs `serverless-http`. Cold starts are milliseconds for a thin API. |
+| GCP | Cloud Run (2M requests, 360,000 GB-s, 180,000 vCPU-s/month, always free) | Standard container, no code changes. Scale-to-zero is fine here. |
+| Azure | Container Apps (180,000 vCPU-s + 360,000 GiB-s + 2M requests/month, always free) or App Service Free (F1) | Comparable to Cloud Run. |
+
+Also largely unchanged — but note the server is now a **job broker**, so it must not hold a request open for the duration of a transfer. Its own timeout limits stop being a concern precisely because the integration plan made the API async.
 
 ### Postgres
 | Cloud | Free option | Notes |
 |---|---|---|
-| AWS | RDS free tier: `db.t3.micro`/`db.t4g.micro`, 750 hrs/mo + 20 GB storage — **12 months only** on a new account | Becomes a paid resource (~$15+/mo) after the trial year. |
-| GCP | No free Cloud SQL tier | Cheapest path is self-hosting Postgres on the always-free `e2-micro` VM (see below), or using a third-party free tier (Supabase/Neon, both have generous permanent free Postgres and are commonly paired with GCP/Vercel-style stacks). |
-| Azure | Azure Database for PostgreSQL Flexible Server: `B1ms`, 750 hrs/mo + 32 GB storage — **12 months only**, part of the Azure free account | Same expiry caveat as AWS RDS. |
+| AWS | RDS `db.t3.micro`/`db.t4g.micro`, 750 hrs/mo + 20 GB — **12 months only** | ~$15+/mo afterwards. |
+| GCP | No free Cloud SQL tier | Previously suggested self-hosting on `e2-micro`; that box is now spoken for (and too small), so this means a third-party free tier. |
+| Azure | PostgreSQL Flexible Server `B1ms`, 750 hrs/mo + 32 GB — **12 months only** | Same expiry caveat. |
 
-None of the three clouds offers a managed Postgres that's free forever. For a project meant to stay free indefinitely, either self-host Postgres on a permanently-free VM, or use a non-cloud-giant managed free tier (Supabase, Neon — both have no-credit-card, no-expiry free plans) reached over the public internet from whichever cloud runs `server/`.
+None of the three offers a free-forever managed Postgres. **Supabase or Neon** (no credit card, no expiry) reached over the internet is the pragmatic choice, and more clearly so now that the `e2-micro` self-hosting option is off the table.
 
-### ML microservice (`stylizer/`)
-| Cloud | Free option | Fit for "stays warm" |
+### The style-transfer service (`stylizer/`)
+
+This is where the analysis genuinely changes. Requirements are now: **≥2 GB RAM**, several minutes of uninterrupted execution per job, and ~548 MB of weights available at start.
+
+| Cloud | Free option | Fit, given the script |
 |---|---|---|
-| AWS | Lambda with container image (up to 10 GB, up to 10 GB RAM) — always free quota, but cold start reloads the model (can be 10s+ for a multi-hundred-MB model); or EC2 `t2/t3.micro`/`.small` — 12 months only, and `.micro` (1 GB RAM) is likely too small for the model + PyTorch/TF runtime. | Poor (serverless) / time-limited (VM) |
-| GCP | Cloud Run — same always-free quota as the API above, plus `min-instances=1` can be set to avoid cold starts, but that keeps a billed instance running 24/7 (no longer inside the always-free quota once minutes exceed the monthly grant); **or** the always-free `e2-micro` Compute Engine VM (1 vCPU, 1 GB RAM, one instance, `us-west1`/`us-central1`/`us-east1` only, no expiry) | Best fit if the model is small/quantized enough for ~1 GB RAM; otherwise same cold-start trade-off as Lambda |
-| Azure | Container Apps (same always-free quota as above, same `min-replicas` trade-off) or Azure Functions Premium/Consumption (cold starts) | Same trade-offs as AWS/GCP equivalents |
-
-**GCP's `e2-micro` is the only genuinely-free-forever always-on compute among the three clouds.** It's the natural home for `stylizer/` *if* the eventual model is small (a distilled/quantized style-transfer model, not a multi-GB checkpoint) — this can't be confirmed until the user's actual Python code and model size are shared (same open item as the integration plan).
+| AWS | Lambda container image (up to 10 GB image, 10 GB RAM) — always-free quota | RAM is fine, but the **15-minute hard execution cap** is the risk: a 300-step job at higher resolution can approach it, and there's no partial result. Weights must be baked into the image. Cost accrues against the 400,000 GB-s grant fast: at 2 GB, that's ~200,000 seconds ≈ 55 hours of compute/month, so roughly 600–1,600 jobs — plenty for personal use. |
+| AWS | EC2 `t3.small` (2 GB) | Not free — `t2/t3.micro` (1 GB) is the free-tier size and is too small, same as `e2-micro`. |
+| GCP | Cloud Run, configured with **2–4 GB RAM** | Good fit. Up to 8 GB RAM and a 60-minute request timeout, comfortably past the script's needs. Scale-to-zero costs a cold start (container + weights), acceptable under an async API. The always-free grant is **360,000 GB-s**, so at 2 GB that's ~180,000 seconds ≈ 50 hours/month. `min-instances=1` is still available but no longer worth paying for. |
+| GCP | `e2-micro` always-free VM | **No longer recommended.** 1 GB RAM will not hold PyTorch + VGG-19 + a per-request deepcopy. This was the previous primary recommendation and is withdrawn. |
+| Azure | Container Apps, scaled to 2 GB | Equivalent to Cloud Run; free grant 360,000 GiB-s. Consumption plan supports long-running requests. |
+| Any | GPU | No free GPU tier exists on any of the three for sustained use. A GPU would cut runtime ~10–50× and enable the script's 1000px path, but it's a paid decision. |
 
 ## Recommendation
 
-**Primary: GCP**, because it's the only cloud with a permanently-free always-on VM, which best matches the "load the model once, stay warm" requirement:
-- `client/` → Firebase Hosting (free, always)
-- `server/` → Cloud Run (free tier, scale-to-zero is fine for a thin proxy API)
-- `stylizer/` → the always-free `e2-micro` VM, running `uvicorn` directly (systemd service) — model loads once at boot and stays warm indefinitely, no cold starts, no billing risk
-- Postgres → self-hosted on the same `e2-micro` VM (if RAM allows once the model is loaded) or a free-forever third-party (Supabase/Neon) reached over the internet
+**Primary: GCP**, but for a different reason than before — not the free always-on VM (now ruled out), but because **Cloud Run's memory ceiling and 60-minute request timeout are the most forgiving fit for a multi-minute, ~2 GB job inside a free tier.**
 
-**Fallback if the model turns out too large for 1 GB RAM:** drop the "always warm" requirement and run `stylizer/` on Cloud Run or AWS Lambda (container image) with `min-instances=0`, accepting a cold start (one-time model load) on the first request after idle, then warm responses until the container is reclaimed. This stays entirely inside always-free quotas for hobby-level traffic and requires no VM management, at the cost of occasional slow first-requests — likely an acceptable trade for a personal/demo project.
+- `client/` → Firebase Hosting
+- `server/` → Cloud Run, small (512 MB), scale-to-zero
+- `stylizer/` → Cloud Run, **2 GB RAM, generous timeout, `min-instances=0`**, weights baked into the container image so cold start is container boot + model load rather than a 548 MB download
+- Postgres → Supabase or Neon free tier
+- Output images → a small object-storage bucket, or straight back through the API for a personal-scale project
 
-**Why not AWS or Azure as primary:** both have broadly equivalent serverless free tiers to GCP's Cloud Run, but neither offers a free-forever always-on VM (only 12-month trial VMs), so neither can satisfy "stays warm indefinitely" without eventually incurring cost.
+**Second choice: Azure Container Apps**, which is close to equivalent. **AWS Lambda** works too and its RAM ceiling is the highest of the three, but the 15-minute execution cap is a real ceiling on job size rather than a soft cost, so it constrains the resolution/step-count you can offer.
 
-## Non-cloud-giant alternatives (worth flagging, not explored in depth)
+**What to accept:** a cold start on the first request after idle. Because the integration plan already builds submit-and-poll with a live progress indicator, this lands inside a wait the user can see, which is why it's no longer worth contorting the architecture to avoid.
 
-Since the ask was specifically AWS/GCP/Azure, this doc stays scoped there, but for a hobby/personal project it's worth knowing that platforms like **Render**, **Railway**, or **Fly.io** (for the API + model service) and **Vercel**/**Netlify** (for the static client) often have simpler free tiers and zero-config deploys than the big three, at the cost of the same "cold start vs. free always-on" trade-off described above. Worth a follow-up doc if the big-three setup proves too much operational overhead for this project's size.
+**What would change this:** if runtime proves worse than estimated, or if 1000px output is wanted, the answer stops being a free tier and becomes a paid GPU instance. That decision needs a real measurement first (see open items).
+
+## Non-cloud-giant alternatives
+
+The ask was AWS/GCP/Azure, so this doc stays scoped there, but for a personal project **Render**, **Railway**, and **Fly.io** deploy a containerized Python service with far less ceremony, and **Vercel**/**Netlify** handle the static client. Free tiers there are generally tighter on RAM than Cloud Run's configurable 2–4 GB, which is exactly the axis that matters here — worth checking against the ≥2 GB requirement rather than assuming.
 
 ## Open items
-- Model size/framework/RAM footprint is unknown until the user's Python style-transfer code is shared (same blocker as the integration plan) — this determines whether the `e2-micro` VM plan is viable or whether the serverless-with-cold-start fallback is required.
-- Expected traffic/usage pattern (personal project vs. shared demo) affects whether free-tier request/compute quotas are sufficient.
-- No CI/CD, custom domain, HTTPS, or secrets-management setup is covered here — follow-up once a target cloud is chosen.
+
+- **Measure before committing.** Peak RSS and wall-clock for one job at 256px and at 512px would settle the instance sizing, which drives every recommendation above. The "≥2 GB" figure is reasoned from PyTorch's typical footprint, not measured — torch isn't installed on the dev machine.
+- **Target resolution and step count** (open questions 2 and 3 in the integration plan) set the per-job cost, and therefore how many jobs fit in a monthly free grant.
+- Whether outputs are retained (and for how long) determines whether object storage is needed or results can be transient.
+- Expected traffic: the GB-s grants above allow roughly 50 hours of 2 GB compute per month — fine for personal use, quickly exhausted by a shared demo.
+- No CI/CD, custom domain, HTTPS, or secrets management is covered here — follow-up once a target is chosen.
